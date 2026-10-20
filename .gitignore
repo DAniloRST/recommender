@@ -3,3 +3,4 @@ __pycache__/
 .env
 *.pyc
 tagged_descriptions.txt
+chroma_db/

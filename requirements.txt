@@ -1,0 +1,6 @@
+pandas
+torch
+langchain-chroma
+langchain-core
+langchain-huggingface
+sentence-transformers
