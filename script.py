@@ -1,8 +1,4 @@
-"""Local semantic search for the book catalogue.
 
-The embeddings are generated locally, so this script does not require an
-OpenAI API key. The first run downloads the Hugging Face model.
-"""
 
 from __future__ import annotations
 
