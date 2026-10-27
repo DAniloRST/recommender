@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 tagged_descriptions.txt
 chroma_db/
+db_postagens/
+postagens_texto.txt
