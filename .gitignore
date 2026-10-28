@@ -5,4 +5,5 @@ __pycache__/
 tagged_descriptions.txt
 chroma_db/
 db_postagens/
+*.state.json
 postagens_texto.txt
