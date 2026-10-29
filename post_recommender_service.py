@@ -176,7 +176,7 @@ def download_csv(
     if previous_state.get("last_modified"):
         headers["If-Modified-Since"] = previous_state["last_modified"]
     try:
-        with urlopen(Request(CSV_URL, headers=headers), timeout=60) as response:
+        with urlopen(Request(CSV_URL, headers=headers), timeout=120) as response:
             data = response.read()
             response_state = {
                 "etag": response.headers.get("ETag", ""),
@@ -242,20 +242,22 @@ class CsvWatcher:
             temporary_csv.unlink(missing_ok=True)
 
     def run(self) -> None:
-        while not self.stop_event.wait(POLL_INTERVAL):
+        while not self.stop_event.wait(30):
             try:
                 self.update_once()
             except Exception as error:
                 print(f"Atualização ignorada; índice anterior mantido: {error}")
+            if self.index.index_hash:
+                self.stop_event.wait(max(0, POLL_INTERVAL - 30))
 
     def run_initial_update(self) -> None:
-        for attempt in range(1, 4):
+        for attempt in range(1, 6):
             try:
                 self.update_once()
                 return
             except Exception as error:
-                print(f"Download inicial do CSV falhou ({attempt}/3): {error}")
-                if attempt < 3:
+                print(f"Download inicial do CSV falhou ({attempt}/5): {error}")
+                if attempt < 5:
                     time.sleep(attempt * 10)
         if CSV_PATH.exists():
             try:
