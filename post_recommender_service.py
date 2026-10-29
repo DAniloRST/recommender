@@ -269,6 +269,24 @@ class RecommenderHandler(BaseHTTPRequestHandler):
     index: PostIndex
 
     def do_GET(self) -> None:
+        if self.path == "/":
+            response = json.dumps(
+                {
+                    "service": "post-recommender",
+                    "status": "online",
+                    "endpoints": {
+                        "health": "GET /health",
+                        "recommend": "POST /recommend",
+                    },
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            return
         if self.path != "/health":
             self.send_error(404, "Rota não encontrada")
             return
