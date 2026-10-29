@@ -7,6 +7,7 @@ import math
 import os
 import re
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -247,6 +248,22 @@ class CsvWatcher:
             except Exception as error:
                 print(f"Atualização ignorada; índice anterior mantido: {error}")
 
+    def run_initial_update(self) -> None:
+        for attempt in range(1, 4):
+            try:
+                self.update_once()
+                return
+            except Exception as error:
+                print(f"Download inicial do CSV falhou ({attempt}/3): {error}")
+                if attempt < 3:
+                    time.sleep(attempt * 10)
+        if CSV_PATH.exists():
+            try:
+                self.index.rebuild(CSV_PATH, file_hash(CSV_PATH))
+                print("Índice carregado a partir do CSV local")
+            except Exception as error:
+                print(f"CSV local inválido; serviço aguardará nova atualização: {error}")
+
 
 class RecommenderHandler(BaseHTTPRequestHandler):
     index: PostIndex
@@ -295,15 +312,8 @@ class RecommenderHandler(BaseHTTPRequestHandler):
 def main() -> None:
     index = PostIndex()
     watcher = CsvWatcher(index)
-    try:
-        watcher.update_once()
-    except Exception as error:
-        if not CSV_PATH.exists():
-            raise RuntimeError("Não foi possível baixar o CSV inicial") from error
-        print(f"Usando CSV local; atualização inicial falhou: {error}")
-        index.rebuild(CSV_PATH, file_hash(CSV_PATH))
-
     RecommenderHandler.index = index
+    threading.Thread(target=watcher.run_initial_update, daemon=True).start()
     threading.Thread(target=watcher.run, daemon=True).start()
     print(f"Serviço de posts em http://{HOST}:{PORT}; verificações a cada {POLL_INTERVAL}s")
     ThreadingHTTPServer((HOST, PORT), RecommenderHandler).serve_forever()
