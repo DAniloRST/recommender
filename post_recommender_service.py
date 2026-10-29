@@ -1,34 +1,29 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import math
 import os
-import shutil
+import re
 import threading
 import uuid
+from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import pandas as pd
-import torch
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
 
-
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 CSV_URL = os.getenv(
     "POSTS_CSV_URL",
     "https://aqui-ta-bom-api.onrender.com/v1/api/postagens/csv",
 )
-CSV_PATH = Path(os.getenv("POSTS_CSV_PATH", ".ipynb_checkpoints/postagens.csv"))
-DATABASE_PATH = Path(os.getenv("POSTS_DATABASE_PATH", "db_postagens"))
+CSV_PATH = Path(os.getenv("POSTS_CSV_PATH", "postagens.csv"))
 POLL_INTERVAL = max(30, int(os.getenv("POSTS_POLL_INTERVAL", "300")))
 HOST = os.getenv("RECOMMENDER_HOST", "0.0.0.0")
-PORT = int(os.getenv("POSTS_RECOMMENDER_PORT", os.getenv("PORT", "8091")))
+PORT = int(os.getenv("PORT", os.getenv("POSTS_RECOMMENDER_PORT", "8091")))
 
 REQUIRED_COLUMNS = {"titulo", "descricao", "nomeRestaurante"}
 TEXT_COLUMNS = ("titulo", "descricao", "nomeRestaurante", "status")
@@ -47,20 +42,7 @@ METADATA_COLUMNS = (
     "quantidadeComentarios",
     "nomesUsuariosCurtiram",
 )
-
-
-def configure_cpu_parallelism() -> None:
-    thread_count = max(1, os.cpu_count() or 1)
-    torch.set_num_threads(thread_count)
-    torch.set_num_interop_threads(max(1, min(thread_count, 8)))
-
-
-def create_embeddings() -> HuggingFaceEmbeddings:
-    return HuggingFaceEmbeddings(
-        model_name=MODEL_NAME,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
-    )
+TOKEN_PATTERN = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
 def file_hash(path: Path) -> str:
@@ -71,25 +53,129 @@ def file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_csv(path: Path) -> pd.DataFrame:
-    posts = pd.read_csv(path, encoding="utf-8-sig")
-    missing = REQUIRED_COLUMNS - set(posts.columns)
-    if missing:
-        raise ValueError(f"Colunas ausentes no CSV: {', '.join(sorted(missing))}")
+def read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            fields = reader.fieldnames or []
+            missing = REQUIRED_COLUMNS - set(fields)
+            if missing:
+                raise ValueError(
+                    f"Colunas ausentes no CSV: {', '.join(sorted(missing))}"
+                )
+            return fields, [
+                {key: (value or "") for key, value in row.items() if key is not None}
+                for row in reader
+            ]
+    except UnicodeDecodeError as error:
+        raise ValueError("O CSV deve usar codificação UTF-8") from error
+
+
+def tokenize(text: str) -> list[str]:
+    return [token.lower() for token in TOKEN_PATTERN.findall(text)]
+
+
+def prepare_posts(path: Path) -> list[dict[str, Any]]:
+    _, rows = read_csv(path)
+    posts: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        search_text = " | ".join(row.get(column, "") for column in TEXT_COLUMNS).strip()
+        if not search_text:
+            continue
+        post_id = row.get("id") or hashlib.sha256(
+            f"{index}:{search_text}".encode("utf-8")
+        ).hexdigest()
+        metadata = {
+            column: row[column]
+            for column in METADATA_COLUMNS
+            if row.get(column, "") != ""
+        }
+        metadata["id"] = post_id
+        posts.append({"metadata": metadata, "text": search_text})
     return posts
+
+
+def build_vectors(posts: list[dict[str, Any]]) -> tuple[dict[str, float], list[dict[str, float]]]:
+    document_frequency: Counter[str] = Counter()
+    token_counts: list[Counter[str]] = []
+    for post in posts:
+        counts = Counter(tokenize(post["text"]))
+        token_counts.append(counts)
+        document_frequency.update(counts)
+
+    total_documents = len(posts)
+    inverse_document_frequency = {
+        token: math.log((total_documents + 1) / (frequency + 1)) + 1
+        for token, frequency in document_frequency.items()
+    }
+    vectors: list[dict[str, float]] = []
+    for counts in token_counts:
+        vector = {token: count * inverse_document_frequency[token] for token, count in counts.items()}
+        norm = math.sqrt(sum(value * value for value in vector.values()))
+        vectors.append(
+            {token: value / norm for token, value in vector.items()} if norm else {}
+        )
+    return inverse_document_frequency, vectors
+
+
+class PostIndex:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.posts: list[dict[str, Any]] = []
+        self.vectors: list[dict[str, float]] = []
+        self.inverse_document_frequency: dict[str, float] = {}
+        self.index_hash = ""
+
+    def rebuild(self, csv_path: Path, content_hash: str) -> None:
+        posts = prepare_posts(csv_path)
+        if not posts:
+            raise ValueError("O CSV não contém postagens utilizáveis")
+        inverse_document_frequency, vectors = build_vectors(posts)
+        with self.lock:
+            self.posts = posts
+            self.vectors = vectors
+            self.inverse_document_frequency = inverse_document_frequency
+            self.index_hash = content_hash
+
+    def recommend(self, query: str, result_count: int) -> list[dict[str, Any]]:
+        query_tokens = Counter(tokenize(query))
+        if not query_tokens:
+            raise ValueError("'query' deve conter texto")
+        with self.lock:
+            query_vector = {
+                token: count * self.inverse_document_frequency[token]
+                for token, count in query_tokens.items()
+                if token in self.inverse_document_frequency
+            }
+            norm = math.sqrt(sum(value * value for value in query_vector.values()))
+            if not norm:
+                return []
+            query_vector = {token: value / norm for token, value in query_vector.items()}
+            scored = [
+                (
+                    sum(query_vector.get(token, 0.0) * value for token, value in vector.items()),
+                    post,
+                )
+                for post, vector in zip(self.posts, self.vectors)
+            ]
+        scored.sort(key=lambda result: result[0], reverse=True)
+        return [
+            {"score": round(score, 6), **post["metadata"], "texto": post["text"]}
+            for score, post in scored[:result_count]
+            if score > 0
+        ]
 
 
 def download_csv(
     destination: Path, previous_state: dict[str, str]
 ) -> tuple[bool, dict[str, str], Path | None]:
     headers = {"User-Agent": "post-recommender/1.0"}
-    for state_key, header_name in (("etag", "If-None-Match"), ("last_modified", "If-Modified-Since")):
-        if previous_state.get(state_key):
-            headers[header_name] = previous_state[state_key]
-
-    request = Request(CSV_URL, headers=headers)
+    if previous_state.get("etag"):
+        headers["If-None-Match"] = previous_state["etag"]
+    if previous_state.get("last_modified"):
+        headers["If-Modified-Since"] = previous_state["last_modified"]
     try:
-        with urlopen(request, timeout=60) as response:
+        with urlopen(Request(CSV_URL, headers=headers), timeout=60) as response:
             data = response.read()
             response_state = {
                 "etag": response.headers.get("ETag", ""),
@@ -103,19 +189,18 @@ def download_csv(
         raise RuntimeError(f"Falha ao acessar o CSV: {error.reason}") from error
 
     new_hash = hashlib.sha256(data).hexdigest()
+    state = {**previous_state, **response_state, "sha256": new_hash}
     if new_hash == previous_state.get("sha256"):
-        return False, {**previous_state, **response_state}, None
-
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+        return False, state, None
     destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     temporary.write_bytes(data)
     try:
-        validate_csv(temporary)
+        read_csv(temporary)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
-
-    return True, {**response_state, "sha256": new_hash}, temporary
+    return True, state, temporary
 
 
 def load_state(path: Path) -> dict[str, str]:
@@ -131,77 +216,6 @@ def save_state(path: Path, state: dict[str, str]) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
-
-
-def prepare_documents(posts: pd.DataFrame) -> list[Document]:
-    posts = posts.dropna(subset=["titulo", "descricao"], how="all").copy()
-    posts["_search_text"] = (
-        posts.reindex(columns=TEXT_COLUMNS, fill_value="")
-        .fillna("")
-        .astype(str)
-        .agg(" | ".join, axis=1)
-        .str.strip()
-    )
-    documents: list[Document] = []
-    for index, post in posts.iterrows():
-        metadata = {
-            column: str(post[column])
-            for column in METADATA_COLUMNS
-            if column in posts.columns and pd.notna(post[column])
-        }
-        post_id = metadata.get("id") or hashlib.sha256(
-            f"{index}:{post['_search_text']}".encode("utf-8")
-        ).hexdigest()
-        metadata["id"] = post_id
-        documents.append(Document(page_content=post["_search_text"], metadata=metadata))
-    return documents
-
-
-class PostIndex:
-    def __init__(self, embeddings: HuggingFaceEmbeddings) -> None:
-        self.embeddings = embeddings
-        self.lock = threading.RLock()
-        self.vector_store: Chroma | None = None
-        self.index_hash = ""
-
-    def rebuild(self, csv_path: Path, content_hash: str) -> None:
-        documents = prepare_documents(validate_csv(csv_path))
-        if not documents:
-            raise ValueError("O CSV não contém postagens utilizáveis")
-
-        DATABASE_PATH.mkdir(parents=True, exist_ok=True)
-        build_path = DATABASE_PATH / f".build-{uuid.uuid4().hex}"
-        try:
-            new_store = Chroma.from_documents(
-                documents=documents,
-                embedding=self.embeddings,
-                collection_name="postagens",
-                persist_directory=str(build_path),
-                ids=[document.metadata["id"] for document in documents],
-            )
-            with self.lock:
-                old_path = getattr(self.vector_store, "_persist_directory", None)
-                self.vector_store = new_store
-                self.index_hash = content_hash
-            if old_path and Path(old_path).exists() and Path(old_path) != build_path:
-                shutil.rmtree(old_path, ignore_errors=True)
-        except Exception:
-            shutil.rmtree(build_path, ignore_errors=True)
-            raise
-
-    def recommend(self, query: str, result_count: int) -> list[dict[str, Any]]:
-        if not query.strip():
-            raise ValueError("'query' deve ser uma string não vazia")
-        with self.lock:
-            if self.vector_store is None:
-                raise RuntimeError("Índice ainda não foi carregado")
-            documents = self.vector_store.similarity_search_with_relevance_scores(
-                query, k=result_count
-            )
-        return [
-            {"score": float(score), **document.metadata, "texto": document.page_content}
-            for document, score in documents
-        ]
 
 
 class CsvWatcher:
@@ -231,7 +245,7 @@ class CsvWatcher:
             try:
                 self.update_once()
             except Exception as error:
-                print(f"Atualização do CSV ignorada; índice anterior mantido: {error}")
+                print(f"Atualização ignorada; índice anterior mantido: {error}")
 
 
 class RecommenderHandler(BaseHTTPRequestHandler):
@@ -258,10 +272,9 @@ class RecommenderHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length))
-            query = payload.get("query", "")
             result_count = min(max(int(payload.get("k", 5)), 1), 50)
             response = json.dumps(
-                {"results": self.index.recommend(str(query), result_count)},
+                {"results": self.index.recommend(str(payload.get("query", "")), result_count)},
                 ensure_ascii=False,
             ).encode("utf-8")
             self.send_response(200)
@@ -280,23 +293,18 @@ class RecommenderHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    configure_cpu_parallelism()
-    embeddings = create_embeddings()
-    index = PostIndex(embeddings)
+    index = PostIndex()
     watcher = CsvWatcher(index)
-
     try:
         watcher.update_once()
     except Exception as error:
         if not CSV_PATH.exists():
             raise RuntimeError("Não foi possível baixar o CSV inicial") from error
         print(f"Usando CSV local; atualização inicial falhou: {error}")
-        local_hash = file_hash(CSV_PATH)
-        index.rebuild(CSV_PATH, local_hash)
+        index.rebuild(CSV_PATH, file_hash(CSV_PATH))
 
     RecommenderHandler.index = index
-    thread = threading.Thread(target=watcher.run, daemon=True)
-    thread.start()
+    threading.Thread(target=watcher.run, daemon=True).start()
     print(f"Serviço de posts em http://{HOST}:{PORT}; verificações a cada {POLL_INTERVAL}s")
     ThreadingHTTPServer((HOST, PORT), RecommenderHandler).serve_forever()
 

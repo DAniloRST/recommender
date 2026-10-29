@@ -2,7 +2,7 @@ services:
   - type: web
     name: post-recommender
     runtime: python
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    buildCommand: pip install --upgrade pip && pip install -r requirements-render.txt
     startCommand: python post_recommender_service.py
     healthCheckPath: /health
     envVars:

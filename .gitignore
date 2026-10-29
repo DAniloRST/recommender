@@ -1,9 +1,47 @@
+# Ambientes e segredos locais
 .venv/
-__pycache__/
+venv/
+env/
 .env
-*.pyc
-tagged_descriptions.txt
+.env.*
+!.env.example
+
+# Cache e arquivos gerados pelo Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDEs e configurações específicas da máquina
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Notebooks temporários e checkpoints
+.ipynb_checkpoints/
+
+# Índices vetoriais, bancos e artefatos gerados localmente
 chroma_db/
 db_postagens/
+*.sqlite
+*.sqlite3
 *.state.json
+*.pickle
+*.bin
+
+# Arquivos temporários e logs
+*.log
+*.tmp
+*.bak
+*.cache
+.DS_Store
+Thumbs.db
+
+# Saídas geradas pelo processamento dos dados
+tagged_descriptions.txt
 postagens_texto.txt
